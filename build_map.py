@@ -114,19 +114,55 @@ def build_overpass_query():
 
 
 def fetch_grocery_stores_from_osm():
+    """Fetch grocery-related features from OpenStreetMap using Overpass.
+
+    This implementation is more robust than a single-post to the default endpoint:
+    - Tries multiple public Overpass endpoints
+    - Sets Accept: application/json header
+    - Logs response bodies when non-200 is returned for diagnostics
+    - Retries next endpoint on failure
+    """
     print("Fetching grocery stores from OpenStreetMap via Overpass...")
 
-    overpass_url = "https://overpass-api.de/api/interpreter"
+    overpass_endpoints = [
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.openstreetmap.ru/api/interpreter",
+        "https://lz4.overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+    ]
     overpass_query = build_overpass_query()
 
-    response = requests.post(
-        overpass_url,
-        data={"data": overpass_query},
-        timeout=240
-    )
-    response.raise_for_status()
+    headers = {"Accept": "application/json"}
 
-    data = response.json()
+    data = None
+    last_exc = None
+    for endpoint in overpass_endpoints:
+        try:
+            print(f"Posting to Overpass endpoint: {endpoint}")
+            response = requests.post(
+                endpoint,
+                data={"data": overpass_query},
+                headers=headers,
+                timeout=240
+            )
+            if response.status_code != 200:
+                print(f"Overpass returned status {response.status_code} for {endpoint}:")
+                # Print a portion of the body for debugging
+                body = response.text or ""
+                print(body[:2000])
+                response.raise_for_status()
+
+            data = response.json()
+            break
+
+        except Exception as exc:
+            print(f"  Request to {endpoint} failed: {exc}")
+            last_exc = exc
+            time.sleep(1.0)
+
+    if data is None:
+        raise RuntimeError("All Overpass endpoints failed") from last_exc
+
     raw_stores = []
 
     for element in data.get("elements", []):
