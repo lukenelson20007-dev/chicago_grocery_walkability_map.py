@@ -119,8 +119,9 @@ def fetch_grocery_stores_from_osm():
     This implementation is more robust than a single-post to the default endpoint:
     - Tries multiple public Overpass endpoints
     - Sets Accept: application/json header
+    - Sends a meaningful User-Agent to avoid rate-limiting
     - Logs response bodies when non-200 is returned for diagnostics
-    - Retries next endpoint on failure
+    - Retries on transient errors with exponential backoff
     """
     print("Fetching grocery stores from OpenStreetMap via Overpass...")
 
@@ -132,33 +133,56 @@ def fetch_grocery_stores_from_osm():
     ]
     overpass_query = build_overpass_query()
 
-    headers = {"Accept": "application/json"}
+    # Include a meaningful User-Agent so public Overpass instances don't immediately rate-limit us.
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "github-actions/BuildMap (+https://github.com/lukenelson20007-dev/chicago_grocery_walkability_map.py)"
+    }
 
     data = None
     last_exc = None
+
+    # Per-endpoint attempts with exponential backoff for transient failures
     for endpoint in overpass_endpoints:
-        try:
-            print(f"Posting to Overpass endpoint: {endpoint}")
-            response = requests.post(
-                endpoint,
-                data={"data": overpass_query},
-                headers=headers,
-                timeout=240
-            )
-            if response.status_code != 200:
+        for attempt in range(1, 4):
+            try:
+                print(f"Posting to Overpass endpoint: {endpoint} (attempt {attempt})")
+                response = requests.post(
+                    endpoint,
+                    data={"data": overpass_query},
+                    headers=headers,
+                    timeout=240
+                )
+
+                if response.status_code == 200:
+                    data = response.json()
+                    break
+
+                # Handle transient server-side responses we can retry on
+                if response.status_code in (429, 502, 503, 504):
+                    print(f"Overpass returned transient status {response.status_code} for {endpoint} (attempt {attempt})")
+                    body = response.text or ""
+                    print(body[:1000])
+                    backoff = 2 ** (attempt - 1)
+                    print(f"Sleeping {backoff}s before retrying...")
+                    time.sleep(backoff)
+                    continue
+
+                # Non-retryable response — log body and raise
                 print(f"Overpass returned status {response.status_code} for {endpoint}:")
-                # Print a portion of the body for debugging
                 body = response.text or ""
                 print(body[:2000])
                 response.raise_for_status()
 
-            data = response.json()
-            break
+            except requests.exceptions.RequestException as exc:
+                print(f"  Request to {endpoint} failed on attempt {attempt}: {exc}")
+                last_exc = exc
+                backoff = 2 ** (attempt - 1)
+                time.sleep(backoff)
+                continue
 
-        except Exception as exc:
-            print(f"  Request to {endpoint} failed: {exc}")
-            last_exc = exc
-            time.sleep(1.0)
+        if data is not None:
+            break
 
     if data is None:
         raise RuntimeError("All Overpass endpoints failed") from last_exc
@@ -577,7 +601,7 @@ def generate_html(stores_geojson, isochrones_geojson, rail_geojson):
       "Dark basemap": darkBase
     }};
 
-    const railLayer = L.geoJSON(railGeoJson, {{
+    const railLayer = L.geoJSON(railGeojson, {{
       style: function(feature) {{
         return {{
           color: "#5e3c99",
