@@ -114,111 +114,66 @@ def build_overpass_query():
 
 
 def fetch_grocery_stores_from_osm():
-    """Fetch grocery-related features from OpenStreetMap using Overpass.
+    """Replacement: fetch grocery stores from the City of Chicago Food Inspections dataset
 
-    This implementation is more robust than a single-post to the default endpoint:
-    - Tries multiple public Overpass endpoints
-    - Sets Accept: application/json header
-    - Sends a meaningful User-Agent to avoid rate-limiting
-    - Logs response bodies when non-200 is returned for diagnostics
-    - Retries on transient errors with exponential backoff
+    We query the Socrata API for recent food inspection records and filter by facility_type
+    values that suggest grocery/supermarket/convenience stores. The function normalizes
+    results into the same store object shape used elsewhere in this script.
     """
-    print("Fetching grocery stores from OpenStreetMap via Overpass...")
+    print("Fetching grocery stores from City of Chicago Food Inspections dataset...")
 
-    overpass_endpoints = [
-        "https://overpass-api.de/api/interpreter",
-        "https://overpass.openstreetmap.ru/api/interpreter",
-        "https://lz4.overpass-api.de/api/interpreter",
-        "https://overpass.kumi.systems/api/interpreter",
-    ]
-    overpass_query = build_overpass_query()
+    # Socrata dataset/resource for Food Inspections
+    socrata_base = "https://data.cityofchicago.org/resource/4ijn-s7e5.json"
 
-    # Include a meaningful User-Agent so public Overpass instances don't immediately rate-limit us.
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": "github-actions/BuildMap (+https://github.com/lukenelson20007-dev/chicago_grocery_walkability_map.py)"
+    # Build a where clause that matches grocery-like facility types (case-insensitive)
+    where_clause = (
+        "latitude IS NOT NULL AND longitude IS NOT NULL AND ("
+        "lower(facility_type) like '%grocery%' OR "
+        "lower(facility_type) like '%convenience%' OR "
+        "lower(facility_type) like '%supermarket%')"
+    )
+
+    params = {
+        "$limit": 50000,
+        "$where": where_clause,
+        "$select": "dba_name,facility_type,latitude,longitude"
     }
 
-    data = None
-    last_exc = None
+    headers = {"User-Agent": "github-actions/BuildMap (+https://github.com/lukenelson20007-dev/chicago_grocery_walkability_map.py)"}
 
-    # Per-endpoint attempts with exponential backoff for transient failures
-    for endpoint in overpass_endpoints:
-        for attempt in range(1, 4):
-            try:
-                print(f"Posting to Overpass endpoint: {endpoint} (attempt {attempt})")
-                response = requests.post(
-                    endpoint,
-                    data={"data": overpass_query},
-                    headers=headers,
-                    timeout=240
-                )
+    try:
+        resp = requests.get(socrata_base, params=params, headers=headers, timeout=120)
+        resp.raise_for_status()
+        rows = resp.json()
 
-                if response.status_code == 200:
-                    data = response.json()
-                    break
-
-                # Handle transient server-side responses we can retry on
-                if response.status_code in (429, 502, 503, 504):
-                    print(f"Overpass returned transient status {response.status_code} for {endpoint} (attempt {attempt})")
-                    body = response.text or ""
-                    print(body[:1000])
-                    backoff = 2 ** (attempt - 1)
-                    print(f"Sleeping {backoff}s before retrying...")
-                    time.sleep(backoff)
-                    continue
-
-                # Non-retryable response — log body and raise
-                print(f"Overpass returned status {response.status_code} for {endpoint}:")
-                body = response.text or ""
-                print(body[:2000])
-                response.raise_for_status()
-
-            except requests.exceptions.RequestException as exc:
-                print(f"  Request to {endpoint} failed on attempt {attempt}: {exc}")
-                last_exc = exc
-                backoff = 2 ** (attempt - 1)
-                time.sleep(backoff)
-                continue
-
-        if data is not None:
-            break
-
-    if data is None:
-        raise RuntimeError("All Overpass endpoints failed") from last_exc
+    except Exception as exc:
+        print(f"Failed to fetch Socrata Food Inspections data: {exc}")
+        raise
 
     raw_stores = []
 
-    for element in data.get("elements", []):
-        tags = element.get("tags", {})
-
-        if element.get("type") == "node":
-            lat = element.get("lat")
-            lon = element.get("lon")
-        else:
-            center = element.get("center", {})
-            lat = center.get("lat")
-            lon = center.get("lon")
-
-        if lat is None or lon is None:
+    for row in rows:
+        try:
+            lat = float(row.get("latitude"))
+            lon = float(row.get("longitude"))
+        except Exception:
             continue
 
-        name = clean_name(tags.get("name"))
-        shop_type = tags.get("shop", "")
-        amenity = tags.get("amenity", "")
+        name = clean_name(row.get("dba_name") or row.get("facility_type") or "Unnamed grocery store")
+        facility_type = row.get("facility_type") or ""
 
         raw_stores.append({
             "name": name,
-            "lat": float(lat),
-            "lon": float(lon),
-            "shop_type": shop_type,
-            "amenity": amenity,
-            "osm_type": element.get("type"),
-            "osm_id": element.get("id"),
-            "source": "OpenStreetMap"
+            "lat": lat,
+            "lon": lon,
+            "shop_type": facility_type,
+            "amenity": "",
+            "osm_type": None,
+            "osm_id": None,
+            "source": "City of Chicago Food Inspections"
         })
 
-    print(f"Raw grocery-like records found: {len(raw_stores)}")
+    print(f"Raw grocery-like records found in Food Inspections: {len(raw_stores)}")
 
     stores = dedupe_stores(raw_stores)
 
