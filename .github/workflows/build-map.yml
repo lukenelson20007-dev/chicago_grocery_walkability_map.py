@@ -25,6 +25,8 @@ jobs:
         pip install -r requirements.txt
     
     - name: Build map
+      env:
+        ORS_API_KEY: ${{ secrets.ORS_API_KEY }}
       run: python build_map.py
     
     - name: Upload map artifact
